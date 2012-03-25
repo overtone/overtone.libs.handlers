@@ -6,7 +6,7 @@
   (:use [clojure.stacktrace]))
 
 (def ^{:dynamic true} *FORCE-SYNC?* false)
-(def ^{:dynamic true} *log-debug* nil)
+(def ^{:dynamic true} *log-fn* nil)
 
 (defn- cpu-count
   "Get the number of CPUs on this machine."
@@ -15,10 +15,10 @@
 
 (defrecord HandlerPool [pool asyncs syncs desc])
 
-(defn- debug
+(defn- log-error
   [& msgs]
-  (when *log-debug*
-    (*log-debug* (apply str msgs))))
+  (when *log-fn*
+    (*log-fn* (apply str msgs))))
 
 (defn mk-handler-pool
   ([] (mk-handler-pool "No description"))
@@ -30,7 +30,6 @@
 
 (defn on-event*
   [handler-ref* event-name key handler-fn]
-  (debug "Adding event handler: " event-name ", " key)
   (dosync
    (let [async-handlers (get @handler-ref* event-name {})]
      (alter handler-ref* assoc event-name (assoc async-handlers key handler-fn))
@@ -100,11 +99,12 @@
         (alter handler-ref* assoc event-name (dissoc handlers key))))))
 
 (defn remove-event-handlers
-  "Remove all handlers (both sync and async) for events of type event-name."
+  "Remove all handlers (both sync and async) for events of type
+  event-name."
   [handler-pool event-name]
   (dosync
-    (alter (:asyncs handler-pool) dissoc event-name)
-    (alter (:syncs handler-pool) dissoc event-name))
+   (alter (:asyncs handler-pool) dissoc event-name)
+   (alter (:syncs handler-pool) dissoc event-name))
   nil)
 
 (defn remove-all-handlers
@@ -120,14 +120,13 @@
   (try
     (handler event-map)
     (catch Exception e
-      (debug "Handler Exception - with event-map: " event-map "\n"
-             (with-out-str (.printStackTrace e))))))
+      (log-error "Handler Exception - with event-map: " event-map "\n"
+                 (with-out-str (.printStackTrace e))))))
 
 (defn- handle-event
-  "Runs the event handlers for the given event, and removes any handler that
-  returns :done."
+  "Runs the event handlers for the given event, and removes any
+  handler that returns :done."
   [handlers* event]
-  (debug "handling event: " event)
   (let [event-name (:event-name event)
         handlers (get @handlers* event-name {})
         drop-keys (doall (map first
@@ -155,20 +154,26 @@
   NOTE: an event requires key/value pairs, and everything gets wrapped
   into an event map.  It will not work if you just pass values.
 
+  Bind overtone.libs.handlers/*log-fn* to your logging function if
+  you wish to have the stacktraces of any exceptions logged.
+
+
   (event ::my-event)
   (event ::filter-sweep-done :instrument :phat-bass)"
   [handler-pool event-name & args]
   {:pre [(even? (count args))]}
-  (debug "event: " event-name args)
   (let [event (apply hash-map :event-name event-name args)]
     (synchronously-handle-events (:syncs handler-pool) event)
     (asynchronously-handle-events (:pool handler-pool) (:asyncs handler-pool) event)))
 
 (defn sync-event
-  "Runs all event handlers synchronously regardless of whether they were
-  declared as async or not. If handlers create new threads which generate
-  events, these will revert back to the default behaviour of event (i.e. not
-  forced sync). See event."
-  [& args]
+  "Runs all event handlers synchronously regardless of whether they
+  were declared as async or not. If handlers create new threads which
+  generate events, these will revert back to the default behaviour of
+  event (i.e. not forced sync). See event.
+
+  Bind overtone.libs.handlers/*log-fn* to your logging function if
+  you wish to have the stacktraces of any exceptions logged."
+  [handler-pool event-name & args]
   (binding [*FORCE-SYNC?* true]
-    (apply event args)))
+    (apply event handler-pool event-name args)))
