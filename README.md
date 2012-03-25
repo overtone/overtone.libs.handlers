@@ -6,7 +6,7 @@ Event handlers library extracted from Overtone.
 
 In your `project.clj`
 
-    [overtone/libs.handlers "0.0.1"]
+    [overtone/libs.handlers "x.y.z"]
 
 In your `ns`
 
