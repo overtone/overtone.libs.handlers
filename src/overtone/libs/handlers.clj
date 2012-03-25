@@ -1,5 +1,5 @@
 (ns
-  ^{:doc "A simple event system that processes fired events in a thread pool."
+  ^{:doc "A simple event system that handles both synchronous and asynchronous events."
      :author "Jeff Rose & Sam Aaron"}
   overtone.libs.handlers
   (:import (java.util.concurrent Executors))
@@ -28,12 +28,101 @@
                 sync-handlers (ref {})]
             (HandlerPool. pool async-handlers sync-handlers desc))))
 
-(defn on-event*
+(defn- count-handlers
+  "Count the number of handlers for the specified event-name and
+  key. Throws an exception if the number is unexpected (i.e. not 0 or
+  1"
+  [handler-pool event-name key]
+  (let [res (dosync
+             (let [s (if (get-in @(:syncs handler-pool) [event-name key]) 1 0)
+                   a (if (get-in @(:asyncs handler-pool) [event-name key]) 1 0)]
+               (+ s a)))]
+    (when (not (or (= 0 res)
+                   (= 1 res)))
+      (throw (Exception.
+              (str "Invalid number of handlers for handler-pool with desc: "
+                   (:desc handler-pool)
+                   ". Expected 0 or 1 handlers for event " event-name
+                   " and key " key ", instead found " res "."))))
+    res))
+
+(defn- clear-empty-handler-maps
+  "Removes any handler maps for events that don't have any registered
+  handlers."
+  [handler-pool]
+  (dosync
+   (doseq [handler-ref* [(:syncs handler-pool) (:asyncs handler-pool)]]
+     (let [handler-map @handler-ref*
+           new-map     (into {} (remove (fn [[k v]] (= v {})) handler-map))]
+       (ref-set handler-ref* new-map)))))
+
+(defn remove-handler
+  "Remove an event handler previously registered to handle events of
+  type event-name Removes both sync and async handlers with a given
+  key for a particular event type. Returns true if removal was
+  successful, nil otherwise.
+
+  (defn my-foo-handler [event] (do-stuff (:val event))
+
+  (add-handler :foo my-foo-handler ::bar-key)
+  (event :foo :val 200) ; my-foo-handler gets called with:
+                        ; {:event-name :foo :val 200}
+  (remove-handler :foo ::bar-key)
+  (event :foo :val 200) ; my-foo-handler no longer called"
+  [handler-pool event-name key]
+  (dosync
+   (let [handler-cnt (count-handlers handler-pool event-name key)]
+     (doseq [handler-ref* [(:syncs handler-pool) (:asyncs handler-pool)]]
+       (let [handlers (get @handler-ref* event-name {})]
+         (alter handler-ref* assoc event-name (dissoc handlers key))))
+     (let [new-handler-cnt (count-handlers handler-pool event-name key)]
+       (not= new-handler-cnt handler-cnt)))
+   (clear-empty-handler-maps handler-pool)))
+
+(defn- count-all-handlers
+  "Count the total number of handlers in the handler-pool"
+  [handler-pool]
+  (letfn [(cnt [handlers]
+            (reduce + (map (fn [[k v]] (count (keys v))) handlers)))]
+    (+ (cnt @(:syncs handler-pool)) (cnt @(:asyncs handler-pool)))))
+
+(defn- returning-count-diff
+  "Return the difference in handler count or nil if no difference."
+  [handler-pool body-fn]
+  (dosync
+   (let [cnt (count-all-handlers handler-pool)]
+     (body-fn)
+     (clear-empty-handler-maps handler-pool)
+     (let [diff (- cnt (count-all-handlers handler-pool))]
+       (if (> diff 0)
+         diff
+         nil)))))
+
+(defn remove-event-handlers
+  "Remove all handlers (both sync and async) for events of type
+  event-name. Returns the number of handlers removed, nil if no
+  handlers were removed."
+  [handler-pool event-name]
+  (returning-count-diff handler-pool
+                        #(dosync
+                           (alter (:asyncs handler-pool) dissoc event-name)
+                           (alter (:syncs handler-pool) dissoc event-name))))
+
+(defn remove-all-handlers
+  "Remove all handlers for all events. Returns the number of handlers
+  removed, nil if no handlers were removed."
+  [handler-pool]
+    (returning-count-diff handler-pool
+                        #(dosync
+                           (ref-set (:asyncs handler-pool) {})
+                           (ref-set (:syncs handler-pool) {}))))
+
+(defn add-handler*
   [handler-ref* event-name key handler-fn]
   (dosync
    (let [async-handlers (get @handler-ref* event-name {})]
      (alter handler-ref* assoc event-name (assoc async-handlers key handler-fn))
-     [event-name ])))
+     [event-name key])))
 
 (defn add-handler
   "Asynchronously runs handler whenever events of type event-name are
@@ -46,14 +135,16 @@
   argument, which is a map containing the :event-name property and any
   other properties specified when it was fired.
 
-  (on-event \"/tr\" ::status-check handler)
-  (on-event :midi-note-down ::note-down (fn [event]
-                                          (funky-bass (:note event))))
+  (add-handler \"/tr\" ::status-check handler)
+  (add-handler :note-down ::note-down (fn [event]
+                                        (funky-bass (:note event))))
 
   Handlers can return :overtone/remove-handler to be removed from the
   handler list after execution."
   [handler-pool event-name key handler-fn]
-  (on-event* (:asyncs handler-pool) event-name key handler-fn))
+  (dosync
+   (remove-handler handler-pool event-name key)
+   (add-handler* (:asyncs handler-pool) event-name key handler-fn)))
 
 
 (defn add-sync-handler
@@ -68,51 +159,19 @@
   the :event-name property and any other properties specified when it
   was fired.
 
-  (on-event \"/tr\" ::status-check handler)
-  (on-event :midi-note-down
-            ::midi-note-down-hdlr
-            (fn [event]
-              (funky-bass (:note event))))
+  (add-sync-handler \"/tr\" ::status-check handler)
+  (add-sync-handler :midi-note-down
+                    ::midi-note-down-hdlr
+                    (fn [event]
+                      (funky-bass (:note event))))
 
 
   Handlers can return :overtone/done to be removed from the handler
   list after execution."
   [handler-pool event-name key handler-fn]
-  (on-event* (:syncs handler-pool) event-name key handler-fn))
-
-(defn remove-handler
-  "Remove an event handler previously registered to handle events of
-  type event-name Removes both sync and async handlers with a given
-  key for a particular event type.
-
-  (defn my-foo-handler [event] (do-stuff (:val event))
-
-  (on-event :foo my-foo-handler ::bar-key)
-  (event :foo :val 200) ; my-foo-handler gets called with:
-                        ; {:event-name :foo :val 200}
-  (remove-handler :foo ::bar-key)
-  (event :foo :val 200) ; my-foo-handler no longer called"
-  [handler-pool event-name key]
   (dosync
-    (doseq [handler-ref* [(:syncs handler-pool) (:asyncs handler-pool)]]
-      (let [handlers (get @handler-ref* event-name {})]
-        (alter handler-ref* assoc event-name (dissoc handlers key))))))
-
-(defn remove-event-handlers
-  "Remove all handlers (both sync and async) for events of type
-  event-name."
-  [handler-pool event-name]
-  (dosync
-   (alter (:asyncs handler-pool) dissoc event-name)
-   (alter (:syncs handler-pool) dissoc event-name))
-  nil)
-
-(defn remove-all-handlers
-  "Remove all handlers for all events"
-  [handler-pool]
-  (dosync
-   (ref-set (:asyncs handler-pool) {})
-   (ref-set (:syncs handler-pool) {})))
+   (remove-handler handler-pool event-name key)
+   (add-handler* (:syncs handler-pool) event-name key handler-fn)))
 
 (defn- run-handler
   "Apply the handler to the args - handling exceptions gracefully."
@@ -177,3 +236,48 @@
   [handler-pool event-name & args]
   (binding [*FORCE-SYNC?* true]
     (apply event handler-pool event-name args)))
+
+(defn- event-keys-map
+  [handlers]
+  (into {} (map (fn [[k v]] [k (keys v)]) handlers)))
+
+(defn all-sync-handler-keys
+  "Returns a map of all events names to a seq of associated sync
+  handler keys for handlers registered with add-sync-handler."
+  [handler-pool]
+  (event-keys-map @(:syncs handler-pool)))
+
+(defn all-async-handler-keys
+  "Returns a map of all events names to a seq of associated async
+  handler keys for handlers registered with add-handler."
+  [handler-pool]
+  (event-keys-map @(:asyncs handler-pool)))
+
+(defn all-handler-keys
+  "Returns a map of all handlers (both sync and async) for all event
+  names to seqs of associated handler keys."
+  [handler-pool]
+  (dosync
+   (let [syncs (event-keys-map @(:syncs handler-pool))
+         asyncs (event-keys-map @(:asyncs handler-pool))]
+     (merge syncs asyncs))))
+
+(defn event-sync-handler-keys
+  "Returns a seq of all sync handler keys for the specified event that
+  have been registered with add-sync-handler."
+  [handler-pool
+  event-name]
+  (get (all-sync-handler-keys handler-pool) event-name))
+
+(defn event-async-handler-keys
+  "Returns a seq of all async handler keys for the specified event
+  that have been registered with add-handler."
+  [handler-pool event-name]
+  (get (all-async-handler-keys handler-pool) event-name))
+
+(defn event-handler-keys
+  "Returns a seq of all handler keys (both sync and async) for the
+  specified event that have been registered with both add-sync-handler
+  and add-handler."
+  [handler-pool event-name]
+  (get (all-handler-keys handler-pool) event-name))
