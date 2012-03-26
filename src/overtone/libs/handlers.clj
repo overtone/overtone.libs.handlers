@@ -166,9 +166,10 @@
                       (funky-bass (:note event))))
 
 
-  Handlers can return :overtone/done to be removed from the handler
-  list after execution."
-  [handler-pool event-name key handler-fn]
+  Handlers can return :overtone/remove-handler to be removed from the
+  handler list after execution."
+  [handler-pool event-name key
+  handler-fn]
   (dosync
    (remove-handler handler-pool event-name key)
    (add-handler* (:syncs handler-pool) event-name key handler-fn)))
@@ -184,13 +185,13 @@
 
 (defn- handle-event
   "Runs the event handlers for the given event, and removes any
-  handler that returns :done."
+  handler that returns :overtone/remove-handler"
   [handlers* event]
   (let [event-name (:event-name event)
         handlers (get @handlers* event-name {})
         drop-keys (doall (map first
                               (filter (fn [[k handler]]
-                                        (= :overtone/done (run-handler handler event)))
+                                        (= :overtone/remove-handler (run-handler handler event)))
                                       handlers)))]
     (dosync
       (alter handlers* assoc event-name
