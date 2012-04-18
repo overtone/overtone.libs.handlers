@@ -5,280 +5,401 @@
   (:import (java.util.concurrent Executors))
   (:use [clojure.stacktrace]))
 
+(defrecord HandlerPool [pool handlers desc])
+
 (def ^{:dynamic true} *FORCE-SYNC?* false)
 (def ^{:dynamic true} *log-fn* nil)
+
+(defn- swap-returning-prev!
+  "Similar to swap! except returns vector containing the previous and new values
+
+  (def a (atom 0))
+  (swap-returning-prev! a inc) ;=> [0 1]"
+  [atom f & args]
+  (loop []
+    (let [old-val  @atom
+          new-val  (apply f (cons old-val args))
+          success? (compare-and-set! atom old-val new-val)]
+      (if success?
+        [old-val new-val]
+        (recur)))))
 
 (defn- cpu-count
   "Get the number of CPUs on this machine."
   []
   (.availableProcessors (Runtime/getRuntime)))
 
-(defrecord HandlerPool [pool asyncs syncs desc])
-
 (defn- log-error
+  "Log error using *log-fn* if bound."
   [& msgs]
   (when *log-fn*
     (*log-fn* (apply str msgs))))
 
-(defn mk-handler-pool
-  ([] (mk-handler-pool "No description"))
-  ([desc] (let [size (+ 2 (cpu-count))
-                pool (Executors/newFixedThreadPool size)
-                async-handlers (ref {})
-                sync-handlers (ref {})]
-            (HandlerPool. pool async-handlers sync-handlers desc))))
+(defn- mk-emh
+  "Create a new event matcher handler map containing only the
+  necessary keys."
+  [syncs asyncs sync-one-shots async-one-shots]
+  (let [emh {}
+        emh (if syncs (assoc emh :syncs syncs) emh)
+        emh (if asyncs (assoc emh :asyncs asyncs) emh)
+        emh (if sync-one-shots (assoc emh :sync-one-shots sync-one-shots) emh)
+        emh (if async-one-shots (assoc emh :async-one-shots async-one-shots) emh)]
+    emh))
 
-(defn- count-handlers
-  "Count the number of handlers for the specified event-name and
-  key. Throws an exception if the number is unexpected (i.e. not 0 or
-  1"
-  [handler-pool event-name key]
-  (let [res (dosync
-             (let [s (if (get-in @(:syncs handler-pool) [event-name key]) 1 0)
-                   a (if (get-in @(:asyncs handler-pool) [event-name key]) 1 0)]
-               (+ s a)))]
-    (when (not (or (= 0 res)
-                   (= 1 res)))
-      (throw (Exception.
-              (str "Invalid number of handlers for handler-pool with desc: "
-                   (:desc handler-pool)
-                   ". Expected 0 or 1 handlers for event " event-name
-                   " and key " key ", instead found " res "."))))
-    res))
+(defn- emh-keys
+  "Return a seq of keys for the given event matcher handlers"
+  [emh]
+  (concat
+   (keys (:syncs emh))
+   (keys (:asyncs emh))
+   (keys (:sync-one-shots emh))
+   (keys (:async-one-shots emh))))
 
-(defn- clear-empty-handler-maps
-  "Removes any handler maps for events that don't have any registered
-  handlers."
-  [handler-pool]
-  (dosync
-   (doseq [handler-ref* [(:syncs handler-pool) (:asyncs handler-pool)]]
-     (let [handler-map @handler-ref*
-           new-map     (into {} (remove (fn [[k v]] (= v {})) handler-map))]
-       (ref-set handler-ref* new-map)))))
+(defn- emh-count-handlers
+  "Count the handlers associated with a single event matcher"
+  [emh]
+  (count (emh-keys emh)))
 
-(defn remove-handler
-  "Remove an event handler previously registered to handle events of
-  type event-name Removes both sync and async handlers with a given
-  key for a particular event type. Returns true if removal was
-  successful, nil otherwise.
+(defn- emh-rm-key
+  "Returns a new event matcher handlers map with the key
+  removed. Returns nil if no matchers remain."
+  [emh key]
+  (let [syncs           (dissoc (:syncs emh) key)
+        asyncs          (dissoc (:asyncs emh) key)
+        sync-one-shots  (dissoc (:sync-one-shots emh) key)
+        async-one-shots (dissoc (:async-one-shots emh) key)
+        new-emh         (mk-emh syncs asyncs sync-one-shots async-one-shots)]
+    (when-not (= 0 (emh-count-handlers new-emh))
+      new-emh)))
 
-  (defn my-foo-handler [event] (do-stuff (:val event))
+(defn- emh-rm-specific-handler
+  "Removes specific handler fun from emh.
+  Returns a new event matcher handlers map with the key
+  removed. Returns nil if no matchers remain."
+  [emh key handler]
+  (let [syncs           (if (= handler (get-in emh [:syncs key]))
+                          (dissoc (:syncs emh) key)
+                          (:syncs emh))
+        asyncs          (if (= handler (get-in emh [:asyncs key]))
+                          (dissoc (:asyncs emh) key)
+                          (:asyncs emh))
+        sync-one-shots  (if (= handler (get-in emh [:sync-one-shots key]))
+                          (dissoc (:sync-one-shots emh) key)
+                          (:sync-one-shots emh))
+        async-one-shots (if (= handler (get-in emh [:async-one-shots key]))
+                          (dissoc (:async-one-shots emh) key)
+                          (:async-one-shots emh))
+        new-emh         (mk-emh syncs asyncs sync-one-shots async-one-shots)]
+    (when-not (= 0 (emh-count-handlers new-emh))
+      new-emh)))
 
-  (add-handler :foo my-foo-handler ::bar-key)
-  (event :foo :val 200) ; my-foo-handler gets called with:
-                        ; {:event-name :foo :val 200}
-  (remove-handler :foo ::bar-key)
-  (event :foo :val 200) ; my-foo-handler no longer called"
-  [handler-pool event-name key]
-  (dosync
-   (let [handler-cnt (count-handlers handler-pool event-name key)]
-     (doseq [handler-ref* [(:syncs handler-pool) (:asyncs handler-pool)]]
-       (let [handlers (get @handler-ref* event-name {})]
-         (alter handler-ref* assoc event-name (dissoc handlers key))))
-     (let [new-handler-cnt (count-handlers handler-pool event-name key)]
-       (not= new-handler-cnt handler-cnt)))
-   (clear-empty-handler-maps handler-pool)))
+(defn- handlers-count-all
+  "Count all handlers in handlers map"
+  [handlers]
+  (reduce (fn [s [_ emh]]
+            (+ s (emh-count-handlers emh)))
+          0
+          handlers))
 
-(defn- count-all-handlers
-  "Count the total number of handlers in the handler-pool"
-  [handler-pool]
-  (letfn [(cnt [handlers]
-            (reduce + (map (fn [[k v]] (count (keys v))) handlers)))]
-    (+ (cnt @(:syncs handler-pool)) (cnt @(:asyncs handler-pool)))))
+(defn- handlers-rm-empty-event-matchers
+  "Returns a new handlers map omitting any event matchers which have no
+  associated handler fns"
+  [handlers]
+  (into {} (remove (fn [[k v]] (= v {})) handlers)))
 
-(defn- returning-count-diff
-  "Return the difference in handler count or nil if no difference."
-  [handler-pool body-fn]
-  (dosync
-   (let [cnt (count-all-handlers handler-pool)]
-     (body-fn)
-     (clear-empty-handler-maps handler-pool)
-     (let [diff (- cnt (count-all-handlers handler-pool))]
-       (if (> diff 0)
-         diff
-         nil)))))
+(defn- handlers-keys
+  "Returns a seq of all keys in handlers map"
+  [handlers]
+  (reduce (fn [keys [_ emh]]
+            (concat keys (emh-keys emh)))
+          []
+          handlers))
 
-(defn remove-event-handlers
-  "Remove all handlers (both sync and async) for events of type
-  event-name. Returns the number of handlers removed, nil if no
-  handlers were removed."
-  [handler-pool event-name]
-  (returning-count-diff handler-pool
-                        #(dosync
-                           (alter (:asyncs handler-pool) dissoc event-name)
-                           (alter (:syncs handler-pool) dissoc event-name))))
+(defn- handlers-rm-key
+  "Returns a new handlers map ommitting key. Removes event-matcher if
+  no handlers remain."
+  [handlers key]
+  (into {} (filter second
+                   (map (fn [[event-matcher emh]]
+                          [event-matcher (emh-rm-key emh key)])
+                        handlers))))
 
-(defn remove-all-handlers
-  "Remove all handlers for all events. Returns the number of handlers
-  removed, nil if no handlers were removed."
-  [handler-pool]
-    (returning-count-diff handler-pool
-                        #(dosync
-                           (ref-set (:asyncs handler-pool) {})
-                           (ref-set (:syncs handler-pool) {}))))
-
-(defn add-handler*
-  [handler-ref* event-name key handler-fn]
-  (dosync
-   (let [async-handlers (get @handler-ref* event-name {})]
-     (alter handler-ref* assoc event-name (assoc async-handlers key handler-fn))
-     [event-name key])))
-
-(defn add-handler
-  "Asynchronously runs handler whenever events of type event-name are
-  fired. This asynchronous behaviour can be overridden if required -
-  see sync-event for more information. Events may be triggered with
-  the fns event and sync-event.
-
-  Takes an event-name, a handler fn and a key (to refer back to this
-  handler in the future). The handler must accept a single event
-  argument, which is a map containing the :event-name property and any
-  other properties specified when it was fired.
-
-  (add-handler \"/tr\" ::status-check handler)
-  (add-handler :note-down ::note-down (fn [event]
-                                        (funky-bass (:note event))))
-
-  Handlers can return :overtone/remove-handler to be removed from the
-  handler list after execution."
-  [handler-pool event-name key handler-fn]
-  (dosync
-   (remove-handler handler-pool event-name key)
-   (add-handler* (:asyncs handler-pool) event-name key handler-fn)))
-
-
-(defn add-sync-handler
-  "Synchronously runs handler whenever events of type event-name are
-  fired on the event handling thread i.e. causes the event handling
-  thread to block until all sync events have been handled. Events may
-  be triggered with the fns event and sync-event.
-
-  Takes an event-name(name of the event), a handler fn and a key (to
-  refer back to this handler in the future). The handler can
-  optionally accept a single event argument, which is a map containing
-  the :event-name property and any other properties specified when it
-  was fired.
-
-  (add-sync-handler \"/tr\" ::status-check handler)
-  (add-sync-handler :midi-note-down
-                    ::midi-note-down-hdlr
-                    (fn [event]
-                      (funky-bass (:note event))))
-
-
-  Handlers can return :overtone/remove-handler to be removed from the
-  handler list after execution."
-  [handler-pool event-name key
-  handler-fn]
-  (dosync
-   (remove-handler handler-pool event-name key)
-   (add-handler* (:syncs handler-pool) event-name key handler-fn)))
+(declare remove-handler!)
 
 (defn- run-handler
-  "Apply the handler to the args - handling exceptions gracefully."
-  [handler event-map]
+  "Apply the handler to the args - handling exceptions
+  gracefully. Also remove the handler if it
+  returns :overtone/remove-handler."
+  [key handler event-map hp]
   (try
-    (handler event-map)
+    (let [res (handler event-map)]
+      (when (= :overtone/remove-handler res)
+        (remove-handler! hp key))
+      res)
     (catch Exception e
       (log-error "Handler Exception - with event-map: " event-map "\n"
                  (with-out-str (.printStackTrace e))))))
 
-(defn- handle-event
-  "Runs the event handlers for the given event, and removes any
-  handler that returns :overtone/remove-handler"
-  [handlers* event]
-  (let [event-name (:event-name event)
-        handlers (get @handlers* event-name {})
-        drop-keys (doall (map first
-                              (filter (fn [[k handler]]
-                                        (= :overtone/remove-handler (run-handler handler event)))
-                                      handlers)))]
-    (dosync
-      (alter handlers* assoc event-name
-             (apply dissoc (get @handlers* event-name) drop-keys)))))
+(defn- run-handlers
+  "Trigger all handlers in keyed-fns."
+  [keyed-fns event-map hp]
+  (doseq [[k f] keyed-fns]
+    (run-handler k f event-map hp)))
 
-(defn- synchronously-handle-events
-  [handlers* event]
-  (handle-event handlers* event))
 
-(defn- asynchronously-handle-events
-  [thread-pool handlers* event]
-  (if *FORCE-SYNC?*
-    (handle-event handlers* event)
-    (.execute thread-pool #(handle-event handlers* event))))
+(defn- handlers-rm-specific-handler
+  "Returns a new handlers map ommitting handler. Removes event-matcher
+  if no handlers remain."
+  [handlers key handler]
+  (into {} (filter second
+                   (map (fn [[event-matcher emh]]
+                          [event-matcher (emh-rm-specific-handler emh key handler)])
+                        handlers))))
+
+(defn- remove-specific-handler!
+  "Remove a specific handler fn. Returns true if the fn was removed."
+  [hp key handler]
+  (let [[o n] (swap-returning-prev! (:handlers hp)
+                                    (fn [handlers]
+                                      (handlers-rm-specific-handler handlers key handler)))]
+    (not= o n)))
+
+(defn- handlers-matching-emhs
+  "Returns a seq of event-matcher handler-maps. Currently just returns
+  a direct match of the event-matcher, but this could be expanded to
+  more interesting match algorithms. Therefore returns a result seq to
+  allow these future algorithms to return more than one match."
+  [handlers event-matcher]
+  (let [emh (get handlers event-matcher)]
+    (if emh
+      [emh]
+      [])))
+
+(defn- handlers-event-matcher-keys
+  "Returns a seq of keys representing handlers associated with the
+  specified event-matcher"
+  [handlers event-matcher]
+  (let [emh (get handlers event-matcher {})]
+    (emh-keys emh)))
+
+(declare remove-specific-handler!)
+
+(defn- run-one-shot-handlers
+  "Trigger all handlers in keyed-fns, removing them from the hp before
+  doing so (to ensure they're only executed once)."
+  [keyed-fns event-map hp]
+  (doseq [[k handler] keyed-fns]
+    (when (remove-specific-handler! hp k handler)
+      (run-handler k handler event-map hp))))
+
+(defn- emhs-handle-async-one-shots
+  [emhs event-map pool hp]
+  (let [keyed-fns (apply merge (map (fn [emh] (:async-one-shots emh)) emhs))]
+    (if *FORCE-SYNC?*
+      (run-one-shot-handlers keyed-fns event-map hp)
+      (.execute pool #(run-one-shot-handlers keyed-fns event-map hp)))))
+
+(defn- emhs-handle-sync-one-shots
+  [emhs event-map pool hp]
+  (let [keyed-fns (apply merge (map (fn [emh]  (:sync-one-shots emh)) emhs))]
+    (run-one-shot-handlers keyed-fns event-map hp)))
+
+(defn- emhs-handle-async-events
+  "Runs all async handlers in a thread pool. If binding *FORCE-SYNC?*
+  is true, forces async handlers to execute synchronously on the
+  current thread."
+  [emhs event-map pool hp]
+  (let [keyed-fns (apply merge (map (fn [emh] (:asyncs emh)) emhs))]
+    (if *FORCE-SYNC?*
+      (run-handlers keyed-fns event-map hp)
+      (.execute pool #(run-handlers keyed-fns event-map hp)))))
+
+(defn- emhs-handle-sync-events
+  "Runs all sync handlers on the current thread."
+  [emhs event-map pool hp]
+  (let [keyed-fns (apply merge (map (fn [emh]  (:syncs emh)) emhs))]
+    (run-handlers keyed-fns event-map hp)))
+
+(defn- hp-matching-emhs
+  "Returns a seq of matching event method handles from the handle-pool
+  matching event-matcher."
+  [hp event-matcher]
+  (let [handlers @(:handlers hp)]
+    (handlers-matching-emhs handlers event-matcher)))
+
+;; Public API
+
+(defn mk-handler-pool
+  "Create a new handler pool with an optional description."
+  ([] (mk-handler-pool "No description"))
+  ([desc]
+     (let [size     (+ 2 (cpu-count))
+           pool     (Executors/newFixedThreadPool size)
+           handlers (atom {})]
+            (HandlerPool. pool handlers desc))))
+
+(defn count-handlers
+  "Count all the handlers in the given handler-pool"
+  [hp]
+  (let [handlers @(:handlers hp)]
+    (handlers-count-all handlers)))
+
+(defn add-handler!
+  "Register an asynchronous event handler with the given key and
+  event-matcher to handler pool hp. This key must be unique for the
+  specified handler-pool and if a handler already exists, it will be
+  overriden with this new handler. When events are triggered, this
+  handler will (by default) be executed in the supplied thread-pool if
+  the event-matcher matches the event. If the event is a sync-event,
+  the handler will be executed on the thread that created the event.
+
+  The handler fn must accept one arg - a map of event info.
+
+  If the handler returns the keyword :overtone/remove-handler, the
+  handler will then remove itself. Note, this is not an atomic
+  action. It is therefore possible that the handler is triggered again
+  from a different thread before removing itself. Use a one-shot
+  handler if you want to guarantee a handler is only ever called
+  once."
+  [hp event-matcher key handler]
+  (swap! (:handlers hp)
+         (fn [handlers]
+           (let [handlers   (handlers-rm-key handlers key)
+                 emh        (get handlers event-matcher {})
+                 emh-asyncs (get emh :asyncs {})
+                 emh-asyncs (assoc emh-asyncs key handler)
+                 emh        (assoc emh :asyncs emh-asyncs)]
+             (assoc handlers event-matcher emh))))
+  :added-async-handler)
+
+(defn add-sync-handler!
+  "Register a synchronous event handler with the given key and
+  event-matcher to handler pool hp. The key must be unique for the
+  specif ied handler-pool and if a handler already exists with this
+  key, it will be overriden with this new handler. When events are
+  triggered, this handler will be executed on the thread that created
+  the event (whether async or not) causing the thread to block until
+  completion.
+
+  The handler fn must accept one arg - a map of event info.
+
+  If the handler returns the keyword :overtone/remove-handler, the
+  handler will then remove itself. Note, this is not an atomic
+  action. It is therefore possible that the handler is triggered again
+  from a different thread before removing itself. Use a one-shot
+  handler if you want to guarantee a handler is only ever called
+  once."
+  [hp event-matcher key handler]
+  (swap! (:handlers hp)
+         (fn [handlers]
+           (let [handlers  (handlers-rm-key handlers key)
+                 emh       (get handlers event-matcher {})
+                 emh-syncs (get emh :syncs {})
+                 emh-syncs (assoc emh-syncs key handler)
+                 emh       (assoc emh :syncs emh-syncs)]
+             (assoc handlers event-matcher emh))))
+  :added-sync-handler)
+
+(defn add-one-shot-handler!
+  "Register an asynchronous one-shot handler with the given key and
+  event-matcher to handler pool hp. This key must be unique for the
+  specified handler pool and if a handler already exists with this
+  key, it will be overriden with this new handler. When an event is
+  triggered, this handler will execute in the supplied thread pool if
+  the event matcher matches the event. This handler is guaranteed to
+  execute only once. Once it has completed executing, it is removed
+  automatically.
+
+  The handler fn must accept one arg - a map of event info."
+  [hp event-matcher key handler]
+  (swap! (:handlers hp)
+         (fn [handlers]
+           (let [handlers      (handlers-rm-key handlers key)
+                 emh           (get handlers event-matcher {})
+                 emh-sr-asyncs (get emh :async-one-shots {})
+                 emh-sr-asyncs (assoc emh-sr-asyncs key handler)
+                 emh           (assoc emh :async-one-shots emh-sr-asyncs)]
+             (assoc handlers event-matcher emh))))
+  :added-one-shot-handler)
+
+(defn add-one-shot-sync-handler!
+  "Register a synchronous one-shot handler with the given key and
+  event-matcher to handler pool hp. This key must be unique for the
+  specified handler pool and if a handler already exists with this
+  key, it will be overriden with this new handler.
+
+  When an event is triggered, this handler will execute on the thread
+  that created the event causing the thread to block until completion.
+  This handler is guaranteed to execute only once. Once it has
+  completed executing, it is removed automatically.
+
+  The handler fn must accept one arg - a map of event info."
+  [hp event-matcher key handler]
+  (swap! (:handlers hp)
+         (fn [handlers]
+           (let [handlers     (handlers-rm-key handlers key)
+                 emh          (get handlers event-matcher {})
+                 emh-sr-syncs (get emh :sync-one-shots {})
+                 emh-sr-syncs (assoc emh-sr-syncs key handler)
+                 emh          (assoc emh :sync-one-shots emh-sr-syncs)]
+             (assoc handlers event-matcher emh))))
+  :added-one-shot-sync-handler)
+
+(defn remove-handler!
+  "Remove event handler in handler pool with key."
+  [hp key]
+  (swap! (:handlers hp)
+         (fn [handlers]
+           (handlers-rm-key handlers key)))
+  :handler-removed)
+
+(defn remove-all-handlers!
+  "Removes all handlers from handler pool"
+  [hp]
+  (reset! (:handlers hp)
+          {})
+  :all-handlers-removed)
+
+(defn remove-event-handlers!
+  "Removes all handlers registered with event-matcher from handler
+  pool."
+  [hp event-matcher]
+  (swap! (:handlers hp)
+         (fn [handlers]
+           (dissoc handlers event-matcher)))
+  :event-handlers-removed)
+
+(defn all-keys
+  "Returns a seq of all keys in handler pool hp."
+  [hp]
+  (let [handlers @(:handlers hp)]
+    (handlers-keys handlers)))
+
+(defn event-matcher-keys
+  "Returns a seq of all keys registered with event-matcher within
+  handler pool."
+  [hp event-matcher]
+  (let [handlers @(:handlers hp)
+        emh      (get handlers event-matcher {})]
+    (emh-keys emh)))
 
 (defn event
-  "Fire an event of type event-name with any number of additional
-  properties.
-
-  NOTE: an event requires key/value pairs, and everything gets wrapped
-  into an event map.  It will not work if you just pass values.
-
-  Bind overtone.libs.handlers/*log-fn* to your logging function if
-  you wish to have the stacktraces of any exceptions logged.
-
-
-  (event ::my-event)
-  (event ::filter-sweep-done :instrument :phat-bass)"
-  [handler-pool event-name & args]
-  {:pre [(even? (count args))]}
-  (let [event (apply hash-map :event-name event-name args)]
-    (synchronously-handle-events (:syncs handler-pool) event)
-    (asynchronously-handle-events (:pool handler-pool) (:asyncs handler-pool) event)))
+  "Create a new event for handlers matching event-matcher. This will
+  trigger all matching handlers and call them with event-info as an
+  argument."
+  [hp event-matcher event-info]
+  (let [pool (:pool hp)
+        emhs (hp-matching-emhs hp event-matcher)]
+    (emhs-handle-async-events emhs event-info pool hp)
+    (emhs-handle-sync-events emhs event-info pool hp)
+    (emhs-handle-async-one-shots emhs event-info pool hp)
+    (emhs-handle-sync-one-shots emhs event-info pool hp)))
 
 (defn sync-event
-  "Runs all event handlers synchronously regardless of whether they
-  were declared as async or not. If handlers create new threads which
-  generate events, these will revert back to the default behaviour of
-  event (i.e. not forced sync). See event.
-
-  Bind overtone.libs.handlers/*log-fn* to your logging function if
-  you wish to have the stacktraces of any exceptions logged."
-  [handler-pool event-name & args]
+  "Create a new event for handlers matching event-matcher. This will
+  trigger all matching handlers and call them with event-info as an
+  argument. All handlers will be forced to run on the current thread
+  therefore blocking it until all handlers have completed."
+  [hp event-matcher event-info]
   (binding [*FORCE-SYNC?* true]
-    (apply event handler-pool event-name args)))
-
-(defn- event-keys-map
-  [handlers]
-  (into {} (map (fn [[k v]] [k (keys v)]) handlers)))
-
-(defn all-sync-handler-keys
-  "Returns a map of all events names to a seq of associated sync
-  handler keys for handlers registered with add-sync-handler."
-  [handler-pool]
-  (event-keys-map @(:syncs handler-pool)))
-
-(defn all-async-handler-keys
-  "Returns a map of all events names to a seq of associated async
-  handler keys for handlers registered with add-handler."
-  [handler-pool]
-  (event-keys-map @(:asyncs handler-pool)))
-
-(defn all-handler-keys
-  "Returns a map of all handlers (both sync and async) for all event
-  names to seqs of associated handler keys."
-  [handler-pool]
-  (dosync
-   (let [syncs (event-keys-map @(:syncs handler-pool))
-         asyncs (event-keys-map @(:asyncs handler-pool))]
-     (merge syncs asyncs))))
-
-(defn event-sync-handler-keys
-  "Returns a seq of all sync handler keys for the specified event that
-  have been registered with add-sync-handler."
-  [handler-pool
-  event-name]
-  (get (all-sync-handler-keys handler-pool) event-name))
-
-(defn event-async-handler-keys
-  "Returns a seq of all async handler keys for the specified event
-  that have been registered with add-handler."
-  [handler-pool event-name]
-  (get (all-async-handler-keys handler-pool) event-name))
-
-(defn event-handler-keys
-  "Returns a seq of all handler keys (both sync and async) for the
-  specified event that have been registered with both add-sync-handler
-  and add-handler."
-  [handler-pool event-name]
-  (get (all-handler-keys handler-pool) event-name))
+    (event hp event-matcher event-info)))
