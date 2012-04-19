@@ -164,16 +164,22 @@
                                       (handlers-rm-specific-handler handlers key handler)))]
     (not= o n)))
 
+(defn- default-matcher-fn
+  "Default matcher fn which simply returns the first matcher in
+  event-matchers which is identical to event-matcher."
+  [event-matchers event-matcher]
+  (let [match (some #{event-matcher} event-matchers)]
+    [match]))
+
 (defn- handlers-matching-emhs
   "Returns a seq of event-matcher handler-maps. Currently just returns
   a direct match of the event-matcher, but this could be expanded to
   more interesting match algorithms. Therefore returns a result seq to
   allow these future algorithms to return more than one match."
-  [handlers event-matcher]
-  (let [emh (get handlers event-matcher)]
-    (if emh
-      [emh]
-      [])))
+  [handlers event-matcher matcher-fn]
+  (let [matchers (matcher-fn (keys handlers) event-matcher)
+        matchers (or matchers [])]
+    (map (fn [matcher] (get handlers matcher)) matchers)))
 
 (defn- handlers-event-matcher-keys
   "Returns a seq of keys representing handlers associated with the
@@ -223,9 +229,9 @@
 (defn- hp-matching-emhs
   "Returns a seq of matching event method handles from the handle-pool
   matching event-matcher."
-  [hp event-matcher]
+  [hp event-matcher matcher-fn]
   (let [handlers @(:handlers hp)]
-    (handlers-matching-emhs handlers event-matcher)))
+    (handlers-matching-emhs handlers event-matcher matcher-fn)))
 
 ;; Public API
 
@@ -386,20 +392,36 @@
 (defn event
   "Create a new event for handlers matching event-matcher. This will
   trigger all matching handlers and call them with event-info as an
-  argument."
-  [hp event-matcher event-info]
-  (let [pool (:pool hp)
-        emhs (hp-matching-emhs hp event-matcher)]
-    (emhs-handle-async-events emhs event-info pool hp)
-    (emhs-handle-sync-events emhs event-info pool hp)
-    (emhs-handle-async-one-shots emhs event-info pool hp)
-    (emhs-handle-sync-one-shots emhs event-info pool hp)))
+  argument.
+
+  Accepts an optional matcher-fn which can override the default
+  behaviour for matching the event's event-matcher with the registered
+  handlers' event-matchers. This fn should take two arguments - a seq
+  of the registered event-matchers and the event-matcher of the
+  event. It must return a list of matching event-matchers."
+  ([hp event-matcher] (event hp event-matcher {} default-matcher-fn))
+  ([hp event-matcher event-info] (event hp event-matcher event-info default-matcher-fn))
+  ([hp event-matcher event-info matcher-fn]
+     (let [pool (:pool hp)
+           emhs (hp-matching-emhs hp event-matcher matcher-fn)]
+       (emhs-handle-async-events emhs event-info pool hp)
+       (emhs-handle-sync-events emhs event-info pool hp)
+       (emhs-handle-async-one-shots emhs event-info pool hp)
+       (emhs-handle-sync-one-shots emhs event-info pool hp))))
 
 (defn sync-event
   "Create a new event for handlers matching event-matcher. This will
   trigger all matching handlers and call them with event-info as an
   argument. All handlers will be forced to run on the current thread
-  therefore blocking it until all handlers have completed."
-  [hp event-matcher event-info]
-  (binding [*FORCE-SYNC?* true]
-    (event hp event-matcher event-info)))
+  therefore blocking it until all handlers have completed.
+
+  Accepts an optional matcher-fn which can override the default
+  behaviour for matching the event's event-matcher with the registered
+  handlers' event-matchers. This fn should take two arguments - a seq
+  of the registered event-matchers and the event-matcher of the
+  event. It must return a list of matching event-matchers."
+  ([hp event-matcher] (sync-event hp event-matcher {} default-matcher-fn))
+  ([hp event-matcher event-info] (sync-event hp event-matcher event-info default-matcher-fn))
+  ([hp event-matcher event-info matcher-fn]
+     (binding [*FORCE-SYNC?* true]
+       (event hp event-matcher event-info matcher-fn))))
